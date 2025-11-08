@@ -7,18 +7,21 @@ pipeline {
     environment {
         SCANNER_HOME = tool 'sonar-scanner'
     }
+
     stages {
         stage('Clean Workspace') {
             steps {
                 cleanWs()
             }
         }
+
         stage('Checkout from Git') {
             steps {
-               checkout scmGit(branches: [[name: '*/main']], extensions: [], userRemoteConfigs: [[url: 'https://github.com/kalyanpd/Book-My-Show.git']])
-                sh 'ls -la'  // Verify files after checkout
+                checkout scmGit(branches: [[name: '*/main']], extensions: [], userRemoteConfigs: [[credentialsId: 'git', url: 'https://github.com/kalyanpd-ctrl/Book-My-Show.git']])
+                sh 'ls -la'
             }
         }
+
         stage('SonarQube Analysis') {
             steps {
                 withSonarQubeEnv('sonar-server') {
@@ -29,59 +32,60 @@ pipeline {
                 }
             }
         }
+
         stage('Quality Gate') {
-    steps {
-        script {
-            // Prevent hanging forever
-            catchError(buildResult: 'SUCCESS', stageResult: 'SUCCESS') {
-                timeout(time: 5, unit: 'MINUTES') {
-                    def qg = waitForQualityGate abortPipeline: false, credentialsId: 'Sonar-token'
-                    if (qg.status != 'OK') {
-                        echo "Quality Gate failed: ${qg.status}"
-                    } else {
-                        echo "Quality Gate passed successfully!"
+            steps {
+                script {
+                    catchError(buildResult: 'SUCCESS', stageResult: 'SUCCESS') {
+                        timeout(time: 5, unit: 'MINUTES') {
+                            def qg = waitForQualityGate abortPipeline: false, credentialsId: 'Sonar-token'
+                            if (qg.status != 'OK') {
+                                echo "Quality Gate failed: ${qg.status}"
+                            } else {
+                                echo "Quality Gate passed successfully!"
+                            }
+                        }
                     }
+                    echo "Quality Gate check finished or skipped due to timeout — continuing pipeline..."
                 }
             }
-            echo "Quality Gate check finished or skipped due to timeout — continuing pipeline..."
         }
-    }
-}
 
         stage('Install Dependencies') {
             steps {
                 sh '''
                 cd bookmyshow-app
-                ls -la  # Verify package.json exists
                 if [ -f package.json ]; then
-                    rm -rf node_modules package-lock.json  # Remove old dependencies
-                    npm install  # Install fresh dependencies
+                    rm -rf node_modules package-lock.json
+                    npm install
                 else
-                    echo "Error: package.json not found in bookmyshow-app!"
+                    echo "Error: package.json not found!"
                     exit 1
                 fi
                 '''
             }
         }
+
         stage('OWASP FS Scan') {
-    steps {
-        script {
-            catchError(buildResult: 'SUCCESS', stageResult: 'SUCCESS') {
-                timeout(time: 5, unit: 'MINUTES') {
-                    dependencyCheck additionalArguments: '--scan ./bookmyshow-app --exclude "/node_modules/" --disableYarnAudit --disableNodeAudit --noupdate',
-                                     odcInstallation: 'DP-Check'
-                    dependencyCheckPublisher pattern: '/dependency-check-report.xml'
+            steps {
+                script {
+                    catchError(buildResult: 'SUCCESS', stageResult: 'SUCCESS') {
+                        timeout(time: 5, unit: 'MINUTES') {
+                            dependencyCheck additionalArguments: '--scan ./bookmyshow-app --exclude "/node_modules/" --disableYarnAudit --disableNodeAudit --noupdate',
+                                             odcInstallation: 'DP-Check'
+                            dependencyCheckPublisher pattern: '/dependency-check-report.xml'
+                        }
+                    }
                 }
             }
         }
-    }
-}
 
         stage('Trivy FS Scan') {
             steps {
                 sh 'trivy fs . > trivyfs.txt'
             }
         }
+
         stage('Docker Build & Push') {
             steps {
                 script {
@@ -90,33 +94,49 @@ pipeline {
                         echo "Building Docker image..."
                         docker build --no-cache -t kalyan3599/bms:latest -f bookmyshow-app/Dockerfile bookmyshow-app
 
-                        echo "Pushing Docker image to registry..."
+                        echo "Pushing Docker image..."
                         docker push kalyan3599/bms:latest
                         '''
                     }
                 }
             }
         }
+
         stage('Deploy to Container') {
             steps {
                 sh ''' 
-                echo "Stopping and removing old container..."
+                echo "Stopping old container..."
                 docker stop bms || true
                 docker rm bms || true
 
-                echo "Running new container on port 3000..."
-                docker run -d --restart=always --name bms -p 3000:3000 ASKFORTESAWS/bms:latest
-
-                echo "Checking running containers..."
+                echo "Running new container..."
+                docker run -d --restart=always --name bms -p 3000:3000 kalyan3599/bms:latest
                 docker ps -a
-
-                echo "Fetching logs..."
-                sleep 5  # Give time for the app to start
+                sleep 5
                 docker logs bms
                 '''
             }
         }
-    }
+
+        stage('Deploy to Kubernetes') {
+            steps {
+                withAWS(credentials: 'aws-creds', region: 'ap-south-1') {
+                    script {
+                        sh '''
+                            echo "🚀 Deploying to EKS cluster..."
+                            aws eks update-kubeconfig --name bookmyshow-cluster --region ap-south-1
+                            kubectl apply -f deployment.yml
+                            kubectl apply -f service.yml
+                            kubectl rollout status deployment/bms-app --timeout=180s
+                            kubectl get pods -o wide
+                            kubectl get svc -o wide
+                        '''
+                    }
+                }
+            }
+        }
+    }  // closes stages
+
     post {
         always {
             emailext attachLog: true,
@@ -128,4 +148,4 @@ pipeline {
                 attachmentsPattern: 'trivyfs.txt,trivyimage.txt'
         }
     }
-}
+}  // closes pipeline
